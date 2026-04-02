@@ -53,24 +53,41 @@ class ChunkCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
-        self.req_to_token_pool.free(req.req_pool_idx)
-        self.token_to_kv_pool_allocator.free(kv_indices)
 
-        if isinstance(self.req_to_token_pool, (MiniCPMReqToTokenPool, MiniCPMHybridReqToTokenPool)):
+        # Free sparse k1/k2 BEFORE req_to_token_pool.free(), because free()
+        # zeros the sparse k1/k2 mapping. Reading after free() would get all
+        # zeros and leak every sparse slot.
+        if (
+            self.page_size == 1
+            and isinstance(
+                self.req_to_token_pool,
+                (MiniCPMReqToTokenPool, MiniCPMHybridReqToTokenPool),
+            )
+        ):
             kernel_size = self.req_to_token_pool.kernel_size
             kernel_stride = self.req_to_token_pool.kernel_stride
 
             k1_total = (kv_committed_len - kernel_size) // kernel_stride + 1 if kv_committed_len >= kernel_size else 0
             if k1_total > 0:
                 k1_indices = self.req_to_token_pool.req_to_sparse_k1_token[req.req_pool_idx, :k1_total]
-                self.token_to_kv_pool_allocator.free(k1_indices)
+                # Filter out unallocated slots (value 0 = padding) to avoid
+                # double-freeing the pad slot.  This happens when speculative
+                # decode skips per-step sparse k1/k2 allocation.
+                k1_indices = k1_indices[k1_indices != 0]
+                if k1_indices.numel() > 0:
+                    self.token_to_kv_pool_allocator.free(k1_indices)
 
             k2_kernel_size = kernel_size * 4
             k2_kernel_stride = kernel_stride * 4
             k2_total = (kv_committed_len - k2_kernel_size) // k2_kernel_stride + 1 if kv_committed_len >= k2_kernel_size else 0
             if k2_total > 0:
                 k2_indices = self.req_to_token_pool.req_to_sparse_k2_token[req.req_pool_idx, :k2_total]
-                self.token_to_kv_pool_allocator.free(k2_indices)
+                k2_indices = k2_indices[k2_indices != 0]
+                if k2_indices.numel() > 0:
+                    self.token_to_kv_pool_allocator.free(k2_indices)
+
+        self.req_to_token_pool.free(req.req_pool_idx)
+        self.token_to_kv_pool_allocator.free(kv_indices)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         from sglang.srt.mem_cache.memory_pool import MiniCPMHybridReqToTokenPool
@@ -80,7 +97,13 @@ class ChunkCache(BasePrefixCache):
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
         # sparse k1, k2 cache indices
-        if isinstance(self.req_to_token_pool, (MiniCPMReqToTokenPool, MiniCPMHybridReqToTokenPool)):
+        if (
+            self.page_size == 1
+            and isinstance(
+                self.req_to_token_pool,
+                (MiniCPMReqToTokenPool, MiniCPMHybridReqToTokenPool),
+            )
+        ):
             kernel_size = self.req_to_token_pool.kernel_size
             kernel_stride = self.req_to_token_pool.kernel_stride
             num_tokens = len(req.fill_ids)

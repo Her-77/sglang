@@ -104,19 +104,18 @@ class EAGLEDraftExtendCudaGraphRunner:
                 self.eagle_worker.speculative_algorithm.is_eagle3()
                 and self.eagle_worker.eagle_use_aux_hidden_state
             ):
+                # B42 fix: dynamically compute num_aux instead of hardcoding * 3
+                _eagle_cfg = getattr(
+                    self.model_runner.model_config.hf_config, "eagle_config", {}
+                )
+                _num_aux = len(_eagle_cfg.get("eagle_aux_hidden_state_layer_ids", [0, 0, 0]))
+                _target_hs = (
+                    self.model_runner.model_config.hf_config.target_hidden_size
+                    if hasattr(self.model_runner.model_config.hf_config, "target_hidden_size")
+                    else self.model_runner.model_config.hidden_size
+                )
                 self.hidden_states = torch.zeros(
-                    (
-                        self.max_num_token,
-                        (
-                            self.model_runner.model_config.hf_config.target_hidden_size
-                            * 3
-                            if hasattr(
-                                self.model_runner.model_config.hf_config,
-                                "target_hidden_size",
-                            )
-                            else self.model_runner.model_config.hidden_size * 3
-                        ),
-                    ),
+                    (self.max_num_token, _target_hs * _num_aux),
                     dtype=self.model_runner.dtype,
                 )
             else:

@@ -752,10 +752,7 @@ class EAGLEWorker(TpModelWorker):
         ]
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
 
-        if (
-            self.target_worker.model_runner.hybrid_gdn_config is not None
-            or self.target_worker.model_runner.mamba2_config is not None
-        ):
+        if self.target_worker.model_runner.mambaish_config is not None:
             self._mamba_verify_update(
                 batch, res, logits_output, spec_info, seq_lens_pre_verify
             )
@@ -901,12 +898,16 @@ class EAGLEWorker(TpModelWorker):
         if not input_is_idle and batch.spec_info.verified_id.numel() == 0:
             batch = batch.copy()
             batch.prepare_for_idle()
-            hidden_size = (
-                self.model_config.hidden_size * 3
-                if self.speculative_algorithm.is_eagle3()
+            # B42 fix: dynamically compute hidden dim for variable aux layers
+            if (
+                self.speculative_algorithm.is_eagle3()
                 and self.eagle_use_aux_hidden_state
-                else self.model_config.hidden_size
-            )
+            ):
+                _eagle_cfg = getattr(self.model_config.hf_config, "eagle_config", {})
+                _num_aux = len(_eagle_cfg.get("eagle_aux_hidden_state_layer_ids", [0, 0, 0]))
+                hidden_size = self.model_config.hidden_size * _num_aux
+            else:
+                hidden_size = self.model_config.hidden_size
             batch.spec_info = EagleDraftInput.create_idle_input(
                 device=self.device,
                 hidden_size=hidden_size,

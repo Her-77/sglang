@@ -561,6 +561,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init routed experts capturer
         self.init_routed_experts_capturer()
 
+        # B43 fix: set_eagle3_layers_to_capture MUST be called BEFORE init_device_graphs
+        # so that CG capture allocates aux hidden states buffer with correct dimensions
+        if self.eagle_use_aux_hidden_state:
+            self.model.set_eagle3_layers_to_capture(
+                self.eagle_aux_hidden_state_layer_ids
+            )
+
         if self.device == "cuda":
             self.init_cublas()
             self.init_attention_backend()
@@ -576,11 +583,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if server_args.forward_hooks:
             register_forward_hooks(self.model, server_args.forward_hooks)
-
-        if self.eagle_use_aux_hidden_state:
-            self.model.set_eagle3_layers_to_capture(
-                self.eagle_aux_hidden_state_layer_ids
-            )
 
         # Initialize piecewise CUDA graph
         self.init_piecewise_cuda_graphs()

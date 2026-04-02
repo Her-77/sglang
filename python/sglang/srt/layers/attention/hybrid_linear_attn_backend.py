@@ -300,6 +300,35 @@ class MambaAttnBackendBase(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.forward_metadata = self._forward_metadata(forward_batch)
 
+    def _get_effective_extend_seq_lens(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        if forward_batch.extend_seq_lens is not None:
+            return forward_batch.extend_seq_lens
+
+        if forward_batch.forward_mode.is_target_verify() and forward_batch.spec_info is not None:
+            return torch.full(
+                (forward_batch.batch_size,),
+                forward_batch.spec_info.draft_token_num,
+                dtype=torch.int32,
+                device=self.device,
+            )
+
+        raise RuntimeError(
+            "extend_seq_lens is None but cannot infer an effective value for the hybrid attention backend."
+        )
+
+    def _get_effective_extend_prefix_lens(
+        self, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        if forward_batch.extend_prefix_lens is not None:
+            return forward_batch.extend_prefix_lens
+
+        if forward_batch.forward_mode.is_target_verify():
+            return forward_batch.seq_lens
+
+        raise RuntimeError(
+            "extend_prefix_lens is None but cannot infer an effective value for the hybrid attention backend."
+        )
+
     def _init_track_conv_indices(
         self, query_start_loc: torch.Tensor, forward_batch: ForwardBatch
     ):
@@ -490,6 +519,17 @@ class MambaAttnBackendBase(AttentionBackend):
             dtype=torch.int32,
             device=self.device,
         )
+
+        # Pre-allocate buffers for _forward_target_verify CUDA graph compatibility.
+        # These buffers eliminate dynamic allocations during graph capture/replay.
+        # q/k/v step buffers and output buffer are lazily allocated on first
+        # capture because num_heads and head_dim are not known at this point.
+        self._cg_verify_q_step = None
+        self._cg_verify_k_step = None
+        self._cg_verify_v_step = None
+        self._cg_verify_out = None
+        self._cg_verify_max_bs = max_bs
+        self._cg_verify_draft_token_num = draft_token_num
 
     def _capture_metadata(
         self,
@@ -1373,10 +1413,26 @@ class HybridLinearAttnBackend(AttentionBackend):
     def update_mamba_state_after_mtp_verify(
         self,
         accepted_steps: torch.Tensor,
-        mamba_track_indices: Optional[torch.Tensor],
-        mamba_steps_to_track: Optional[torch.Tensor],
-        model,
+        mamba_track_indices: Optional[torch.Tensor] = None,
+        mamba_steps_to_track: Optional[torch.Tensor] = None,
+        model=None,
     ):
+        """Update recurrent states after speculative verify based on accepted tokens.
+
+        Supports two calling conventions:
+        - 2-arg: (accepted_steps, model) -- from multi_layer_eagle_worker
+        - 4-arg: (accepted_steps, mamba_track_indices, mamba_steps_to_track, model) -- from eagle_worker
+        """
+        # Handle 2-arg calling convention from multi_layer_eagle_worker:
+        # update_mamba_state_after_mtp_verify(steps, model_obj) where model_obj
+        # is passed as the positional arg 'mamba_track_indices'.
+        if model is None and mamba_steps_to_track is None and mamba_track_indices is not None:
+            if not isinstance(mamba_track_indices, torch.Tensor):
+                # It's actually the model object, not a tensor
+                model = mamba_track_indices
+                mamba_track_indices = None
+
+
         request_number = accepted_steps.shape[0]
 
         state_indices_tensor = (
@@ -1392,10 +1448,12 @@ class HybridLinearAttnBackend(AttentionBackend):
             self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
 
-        conv_states = mamba_caches.conv[0]
+        has_conv = mamba_caches.conv and len(mamba_caches.conv) > 0
+        if has_conv:
+            conv_states = mamba_caches.conv[0]
+            intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
         ssm_states = mamba_caches.temporal
         intermediate_state_cache = mamba_caches.intermediate_ssm
-        intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
         # Compute common indices once to avoid duplication
         valid_mask = accepted_steps >= 0
@@ -1410,10 +1468,11 @@ class HybridLinearAttnBackend(AttentionBackend):
             :, src_state_indices, last_steps
         ].to(ssm_states.dtype, copy=False)
 
-        # Scatter into conv_states at the chosen cache lines
-        conv_states[:, dst_state_indices, :] = intermediate_conv_window_cache[
-            :, src_state_indices, last_steps
-        ].to(conv_states.dtype, copy=False)
+        # Scatter into conv_states at the chosen cache lines (if conv states exist)
+        if has_conv:
+            conv_states[:, dst_state_indices, :] = intermediate_conv_window_cache[
+                :, src_state_indices, last_steps
+            ].to(conv_states.dtype, copy=False)
 
         # Track indices used for tracking mamba states for prefix cache
         if mamba_track_indices is not None:
@@ -1431,10 +1490,11 @@ class HybridLinearAttnBackend(AttentionBackend):
                 :, src_track_indices, track_steps
             ].to(ssm_states.dtype, copy=False)
 
-            # scatter into conv_states at the chosen track states
-            conv_states[:, dst_track_indices, :] = intermediate_conv_window_cache[
-                :, src_track_indices, track_steps
-            ].to(conv_states.dtype, copy=False)
+            # scatter into conv_states at the chosen track states (if conv states exist)
+            if has_conv:
+                conv_states[:, dst_track_indices, :] = intermediate_conv_window_cache[
+                    :, src_track_indices, track_steps
+                ].to(conv_states.dtype, copy=False)
 
 
 class SimpleGLAAttnBackend(MambaAttnBackendBase):
@@ -1483,6 +1543,16 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
                 "Simple GLA backend requested but the 'fla' package is not installed. "
                 "Install it or configure the model to use a supported attention backend (e.g., Mamba2)."
             )
+
+        # Pre-allocated staging buffers for _forward_target_verify.
+        # Lazily allocated on first call (need H, D from actual tensors).
+        # Initialized here so eager mode (no CUDA graph) also works.
+        self._cg_verify_q_step = None
+        self._cg_verify_k_step = None
+        self._cg_verify_v_step = None
+        self._cg_verify_out = None
+        self._cg_verify_max_bs = 0
+        self._cg_verify_draft_token_num = 0
 
     def _get_mamba_indices(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Get mamba cache indices with fallback logic.
@@ -1562,71 +1632,204 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
 
         num_heads = q.shape[2]
         head_dim = q.shape[3]
-        if forward_batch.forward_mode.is_decode():
+        effective_extend_seq_lens = None
+        effective_extend_prefix_lens = None
+        is_target_verify = forward_batch.forward_mode.is_target_verify()
+
+        if forward_batch.forward_mode.is_decode() or is_target_verify:
             seq_len = 1
         else:
-            seq_len = torch.max(forward_batch.extend_seq_lens)
+            effective_extend_seq_lens = self._get_effective_extend_seq_lens(
+                forward_batch
+            )
+            seq_len = torch.max(effective_extend_seq_lens)
 
         mamba_indices = self._get_mamba_indices(forward_batch)
         initial_state = None
-        has_initial_state = forward_batch.extend_prefix_lens is not None and forward_batch.extend_prefix_lens > 0
-        if forward_batch.forward_mode.is_decode() or has_initial_state.any():
-            cache_idx = self.req_to_token_pool.mamba_map.get(layer_id)
-            if cache_idx is not None:
-                layer_cache = self.req_to_token_pool.mamba_pool.mamba2_layer_cache(cache_idx)
-                initial_state = layer_cache.temporal[mamba_indices, :].contiguous()
-            else:
-                raise RuntimeError(
-                    f"SimpleGLAAttnBackend layer {layer_id} is missing from mamba_map. "
-                    f"This indicates a misconfiguration - lightning layers must be registered in cache_params.layers. "
-                    f"Available layers: {list(self.req_to_token_pool.mamba_map.keys())}"
-                )
+        cache_idx = self.req_to_token_pool.mamba_map.get(layer_id)
+        if cache_idx is None:
+            raise RuntimeError(
+                f"SimpleGLAAttnBackend layer {layer_id} is missing from mamba_map. "
+                f"This indicates a misconfiguration - lightning layers must be registered in cache_params.layers. "
+                f"Available layers: {list(self.req_to_token_pool.mamba_map.keys())}"
+            )
+        layer_cache = self.req_to_token_pool.mamba_pool.mamba2_layer_cache(cache_idx)
+
+        if forward_batch.forward_mode.is_decode() or is_target_verify:
+            # decode and target_verify always need initial_state; skip .any() which
+            # would cause a CPU-sync forbidden during CUDA graph capture.
+            has_initial_state = True
+        else:
+            effective_extend_prefix_lens = self._get_effective_extend_prefix_lens(
+                forward_batch
+            )
+            has_initial_state = effective_extend_prefix_lens > 0
+        if forward_batch.forward_mode.is_decode() or is_target_verify or (hasattr(has_initial_state, 'any') and has_initial_state.any()):
+            initial_state = layer_cache.temporal[mamba_indices, :].contiguous()
 
         scale = self.scale
-
         g_gamma = self.g_gamma
 
-        mode = "fused_recurrent" if seq_len < 64 else "chunk"
-        if forward_batch.forward_mode.is_decode() or mode == "fused_recurrent":
-            o, final_state = fused_recurrent_simple_gla(
-                q=q,
-                k=k,
-                v=v,
-                g_gamma=g_gamma,
-                scale=scale,
-                initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=self.forward_metadata.query_start_loc,
+        if is_target_verify:
+            # TARGET_VERIFY: process draft tokens step-by-step and cache
+            # intermediate states so update_mamba_state_after_mtp_verify can
+            # pick the state corresponding to the last accepted token.
+            o = self._forward_target_verify(
+                q, k, v, forward_batch, layer_id, layer_cache,
+                cache_idx, mamba_indices, initial_state, scale, g_gamma,
             )
         else:
-            o, final_state = chunk_simple_gla(
-                q=q,
-                k=k,
-                v=v,
-                g_gamma=g_gamma,
-                initial_state=initial_state,
-                output_final_state=True,
-                scale=scale,
-                cu_seqlens=self.forward_metadata.query_start_loc,
-            )
-
-        if final_state is not None:
-            mamba_indices = self._get_mamba_indices(forward_batch)
-            cache_idx = self.req_to_token_pool.mamba_map.get(layer_id)
-
-            if cache_idx is not None:
-                layer_cache = self.req_to_token_pool.mamba_pool.mamba2_layer_cache(cache_idx)
-                layer_cache.temporal[mamba_indices, :] = final_state
-            else:
-                raise RuntimeError(
-                    f"SimpleGLAAttnBackend layer {layer_id} is missing from mamba_map. "
-                    f"Cannot save state - layer must be registered in cache_params.layers. "
-                    f"Available layers: {list(self.req_to_token_pool.mamba_map.keys())}"
+            mode = "fused_recurrent" if seq_len < 64 else "chunk"
+            if forward_batch.forward_mode.is_decode() or mode == "fused_recurrent":
+                o, final_state = fused_recurrent_simple_gla(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g_gamma=g_gamma,
+                    scale=scale,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    cu_seqlens=self.forward_metadata.query_start_loc,
                 )
+            else:
+                o, final_state = chunk_simple_gla(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g_gamma=g_gamma,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    scale=scale,
+                    cu_seqlens=self.forward_metadata.query_start_loc,
+                )
+
+            if final_state is not None:
+                layer_cache.temporal[mamba_indices, :] = final_state
 
         o = o.reshape(-1, num_heads * head_dim)
 
         return o
+
+    def _forward_target_verify(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        layer_cache,
+        cache_idx: int,
+        mamba_indices: torch.Tensor,
+        initial_state: torch.Tensor,
+        scale: float,
+        g_gamma: torch.Tensor,
+    ) -> torch.Tensor:
+        """Handle TARGET_VERIFY mode for SimpleGLA with intermediate state caching.
+
+        CUDA-graph-compatible version: all dynamic allocations removed.
+
+        During speculative verify, multiple draft tokens are processed at once.
+        We need to cache the GLA state after each token so that
+        update_mamba_state_after_mtp_verify can later pick the state
+        corresponding to the last accepted token (rolling back rejected ones).
+
+        Strategy: process tokens one-by-one using the SAME fused kernel
+        (fused_recurrent_simple_gla) to guarantee bit-exact state parity
+        with normal decode. Each step yields both the correct output vector
+        and the exact final state that the kernel would produce, avoiding
+        any precision mismatch from a hand-written Python recurrence.
+
+        CUDA graph compatibility:
+        - No torch.arange() — reuse pre-allocated cu_seqlens buffer
+        - No outputs=[] + torch.cat() — write into pre-allocated output buffer
+        - No .transpose().contiguous() — copy_ into pre-allocated staging buffers
+        - intermediate_ssm indexed with slice instead of arange
+        """
+        draft_token_num = forward_batch.spec_info.draft_token_num
+        batch_size = forward_batch.batch_size
+        H = q.shape[2]
+        D = q.shape[3]
+
+        intermediate_ssm = layer_cache.intermediate_ssm
+
+        # Reuse the pre-allocated cu_seqlens buffer from init_cuda_graph_state().
+        # cached_cuda_graph_decode_query_start_loc is [0, 1, 2, ..., max_bs],
+        # which is exactly what single-token-per-sequence verify needs.
+        # In eager mode (CUDA graph disabled), the buffer may not exist yet,
+        # so fall back to creating one (this allocation is fine outside capture).
+        if self.cached_cuda_graph_decode_query_start_loc is not None:
+            single_cu = self.cached_cuda_graph_decode_query_start_loc[:batch_size + 1]
+        else:
+            single_cu = torch.arange(
+                batch_size + 1, dtype=torch.int32, device=q.device
+            )
+
+        # Reshape q/k/v from [1, B*N, H, D] -> [B, N, H, D]
+        q_4d = q.squeeze(0).reshape(batch_size, draft_token_num, H, D)
+        k_4d = k.squeeze(0).reshape(batch_size, draft_token_num, H, D)
+        v_4d = v.squeeze(0).reshape(batch_size, draft_token_num, H, D)
+
+        # Lazy initialization of pre-allocated staging buffers.
+        # We cannot allocate in init_cuda_graph_state() because num_heads (H)
+        # and head_dim (D) are not known at that point.
+        # Once allocated, these buffers are reused across all subsequent calls
+        # (both eager and CUDA graph replay).
+        if self._cg_verify_q_step is None or self._cg_verify_q_step.shape[1] < batch_size:
+            max_bs = max(batch_size, getattr(self, '_cg_verify_max_bs', batch_size))
+            max_draft = max(draft_token_num, getattr(self, '_cg_verify_draft_token_num', draft_token_num))
+            self._cg_verify_q_step = torch.empty(1, max_bs, H, D, dtype=q.dtype, device=q.device)
+            self._cg_verify_k_step = torch.empty(1, max_bs, H, D, dtype=q.dtype, device=q.device)
+            self._cg_verify_v_step = torch.empty(1, max_bs, H, D, dtype=q.dtype, device=q.device)
+            self._cg_verify_out = torch.empty(max_bs, max_draft, H, D, dtype=q.dtype, device=q.device)
+
+        # Slice pre-allocated buffers to the current batch/draft size.
+        q_step_buf = self._cg_verify_q_step[:, :batch_size]
+        k_step_buf = self._cg_verify_k_step[:, :batch_size]
+        v_step_buf = self._cg_verify_v_step[:, :batch_size]
+        out_buf = self._cg_verify_out[:batch_size, :draft_token_num]
+
+        current_state = initial_state  # [B, H, K, V]
+
+        for step in range(draft_token_num):
+            # Copy into pre-allocated contiguous staging buffers instead of
+            # doing .transpose(0,1).contiguous() which allocates a new tensor.
+            # q_4d[:, step] is [B, H, D]; copy into q_step_buf[0] which is [B, H, D].
+            q_step_buf[0].copy_(q_4d[:, step])
+            k_step_buf[0].copy_(k_4d[:, step])
+            v_step_buf[0].copy_(v_4d[:, step])
+
+            o_step, next_state = fused_recurrent_simple_gla(
+                q=q_step_buf,
+                k=k_step_buf,
+                v=v_step_buf,
+                g_gamma=g_gamma,
+                scale=scale,
+                initial_state=current_state,
+                output_final_state=True,
+                cu_seqlens=single_cu,
+            )
+            # o_step: [1, B, H, D], next_state: [B, H, K, V]
+
+            # Write directly into the output buffer slice instead of
+            # appending to a list and later doing torch.cat().
+            out_buf[:, step].copy_(o_step[0])
+
+            # Cache intermediate state for rollback.
+            # Use slice [:batch_size] instead of torch.arange-based indexing.
+            intermediate_ssm[:batch_size, step] = next_state.to(
+                intermediate_ssm.dtype
+            )
+
+            current_state = next_state
+
+        # Output layout:
+        # out_buf is [B, N, H, D] with tokens grouped by sequence
+        #   i.e. [seq0_tok0, seq0_tok1, ..., seq1_tok0, seq1_tok1, ...]
+        # reshape to [1, B*N, H, D] preserves sequence-major ordering,
+        # which matches the old code's transpose(1,2) re-interleave result.
+        # Do NOT update the main state here -- update_mamba_state_after_mtp_verify
+        # will pick the correct intermediate state based on accepted tokens.
+        return out_buf.reshape(1, batch_size * draft_token_num, H, D)
 
     def forward_decode(
         self,

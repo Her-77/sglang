@@ -106,7 +106,16 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         if batch.forward_mode.is_idle():
             return
 
-        batch.input_ids = self.draft_token
+        # 处理越界 draft token：draft model 可能有更大的 vocab（如 STANDALONE 模式）。
+        # 只 clamp batch.input_ids 防止 embedding lookup 越界 crash，
+        # 但保留 self.draft_token 原始值，使越界 token 在 verify 时被自然拒绝
+        # （target model 的 argmax 永远不会产生越界 token ID）。
+        target_vocab_size = batch.model_config.vocab_size
+        if target_vocab_size is not None and self.draft_token.max() >= target_vocab_size:
+            # input_ids 用 clamp 后的副本（安全 embedding lookup）
+            batch.input_ids = self.draft_token.clamp(max=target_vocab_size - 1)
+        else:
+            batch.input_ids = self.draft_token
 
         if page_size == 1:
             batch.out_cache_loc = alloc_token_slots(
@@ -144,6 +153,108 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             batch.out_cache_loc,
             bs,
         )
+
+        # Allocate and write sparse k1/k2 slots for draft tokens (verify path)
+        # In the normal decode path, prepare_for_decode + alloc_for_decode handles this.
+        # Spec decode verify allocates multiple tokens at once, so we compute which
+        # positions in [seq_len+1 .. seq_len+draft_token_num] trigger sparse k1/k2 entries.
+        # NOTE: This is only correct for topk=1 (chain speculation) where draft positions
+        # are sequential. For topk > 1 (tree speculation), the accepted tokens are compacted
+        # after verification and positions change, which would require sparse k1/k2 rewrite.
+        if (
+            batch.model_config.has_sparse_attention
+            and hasattr(batch.req_to_token_pool, 'req_to_sparse_k1_token')
+            and batch.req_to_token_pool.req_to_sparse_k1_token is not None
+        ):
+            kernel_size = batch.model_config.sparse_kernel_size
+            kernel_stride = batch.model_config.sparse_kernel_stride
+            k2_kernel_size = kernel_size * 4
+            k2_kernel_stride = kernel_stride * 4
+
+            seq_lens_cpu = batch.seq_lens_cpu
+            # For each request, check each draft position to see if it triggers sparse k1/k2
+            token_num_sparse_k1 = []
+            token_num_sparse_k2 = []
+            for batch_idx in range(bs):
+                sl = seq_lens_cpu[batch_idx].item()
+                k1_count = 0
+                k2_count = 0
+                for d in range(1, self.draft_token_num + 1):
+                    pos = sl + d  # seq_len after appending d-th draft token
+                    if pos >= kernel_size and (pos - kernel_size) % kernel_stride == 0:
+                        k1_count += 1
+                    if pos >= k2_kernel_size and (pos - k2_kernel_size) % k2_kernel_stride == 0:
+                        k2_count += 1
+                token_num_sparse_k1.append(k1_count)
+                token_num_sparse_k2.append(k2_count)
+
+            token_sum_sparse_k1 = sum(token_num_sparse_k1)
+            token_sum_sparse_k2 = sum(token_num_sparse_k2)
+
+            # Allocate sparse k1 slots
+            sparse_k1_loc = None
+            if token_sum_sparse_k1 > 0:
+                sparse_k1_loc = alloc_token_slots(batch.tree_cache, token_sum_sparse_k1)
+            # Allocate sparse k2 slots
+            sparse_k2_loc = None
+            if token_sum_sparse_k2 > 0:
+                sparse_k2_loc = alloc_token_slots(batch.tree_cache, token_sum_sparse_k2)
+
+            # Write sparse k1 entries into req_to_sparse_k1_token
+            if sparse_k1_loc is not None:
+                pt = 0
+                for i in range(bs):
+                    if token_num_sparse_k1[i] > 0:
+                        seq_len = seq_lens_cpu[i].item()
+                        # Current k1 length before draft tokens
+                        k1_len = (seq_len - kernel_size) // kernel_stride + 1 if seq_len >= kernel_size else 0
+                        num_k1 = token_num_sparse_k1[i]
+                        batch.req_to_token_pool.write_sparse_k1(
+                            (batch.req_pool_indices[i], slice(k1_len, k1_len + num_k1)),
+                            sparse_k1_loc[pt : pt + num_k1].to(torch.int32),
+                        )
+                        pt += num_k1
+
+            # Write sparse k2 entries into req_to_sparse_k2_token
+            if sparse_k2_loc is not None:
+                pt = 0
+                for i in range(bs):
+                    if token_num_sparse_k2[i] > 0:
+                        seq_len = seq_lens_cpu[i].item()
+                        # Current k2 length before draft tokens
+                        k2_len = (seq_len - k2_kernel_size) // k2_kernel_stride + 1 if seq_len >= k2_kernel_size else 0
+                        num_k2 = token_num_sparse_k2[i]
+                        batch.req_to_token_pool.write_sparse_k2(
+                            (batch.req_pool_indices[i], slice(k2_len, k2_len + num_k2)),
+                            sparse_k2_loc[pt : pt + num_k2].to(torch.int32),
+                        )
+                        pt += num_k2
+
+            # Store on batch for use during verify (freeing rejected slots)
+            batch.token_num_sparse_k1_cpu = torch.tensor(token_num_sparse_k1, dtype=torch.int64)
+            batch.token_num_sparse_k2_cpu = torch.tensor(token_num_sparse_k2, dtype=torch.int64)
+            batch.token_sum_sparse_k1 = token_sum_sparse_k1
+            batch.token_sum_sparse_k2 = token_sum_sparse_k2
+            batch.sparse_k1_loc = sparse_k1_loc
+            batch.sparse_k2_loc = sparse_k2_loc
+
+            # Store per-request detail for verify-time cleanup of rejected k1/k2 slots
+            # For each request, record which draft token offsets (0-based from seq_len+1)
+            # triggered k1 and k2 entries.
+            self._sparse_k1_draft_offsets = []
+            self._sparse_k2_draft_offsets = []
+            for batch_idx in range(bs):
+                sl = seq_lens_cpu[batch_idx].item()
+                k1_offsets = []
+                k2_offsets = []
+                for d in range(self.draft_token_num):
+                    pos = sl + d + 1  # position after appending (d+1)-th token
+                    if pos >= kernel_size and (pos - kernel_size) % kernel_stride == 0:
+                        k1_offsets.append(d)
+                    if pos >= k2_kernel_size and (pos - k2_kernel_size) % k2_kernel_stride == 0:
+                        k2_offsets.append(d)
+                self._sparse_k1_draft_offsets.append(k1_offsets)
+                self._sparse_k2_draft_offsets.append(k2_offsets)
 
         if get_global_server_args().enable_mamba_extra_buffer():
             batch.mamba_track_indices = torch.tensor(
@@ -502,6 +613,68 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 # Copy the kv cache
                 batch.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
                     tgt_cache_loc, src_cache_loc
+                )
+
+        # Free sparse k1/k2 slots for rejected draft tokens
+        # Each request accepted (accept_length[i]+1) tokens (including bonus token).
+        # Draft offsets >= accept_length[i]+1 are rejected; if they had sparse k1/k2
+        # entries, those slots must be freed and the mapping zeroed.
+        if (
+            hasattr(self, '_sparse_k1_draft_offsets')
+            and batch.model_config.has_sparse_attention
+            and hasattr(batch.req_to_token_pool, 'req_to_sparse_k1_token')
+            and batch.req_to_token_pool.req_to_sparse_k1_token is not None
+        ):
+            kernel_size = batch.model_config.sparse_kernel_size
+            kernel_stride = batch.model_config.sparse_kernel_stride
+            k2_kernel_size = kernel_size * 4
+            k2_kernel_stride = kernel_stride * 4
+
+            k1_slots_to_free = []
+            k2_slots_to_free = []
+            for i in range(bs):
+                acc_len = accept_length_list[i]  # number of accepted draft tokens (bonus excluded from offsets)
+                sl = batch.seq_lens_cpu[i].item()  # seq_len BEFORE verify
+                # accepted offsets: 0..acc_len (inclusive, acc_len is the bonus token offset)
+                # rejected offsets: acc_len+1 .. draft_token_num-1
+
+                # k1: free rejected entries and zero them
+                for d in self._sparse_k1_draft_offsets[i]:
+                    if d > acc_len:
+                        # This draft offset was rejected; free its sparse k1 slot
+                        pos = sl + d + 1
+                        k1_idx = (pos - kernel_size) // kernel_stride
+                        slot_val = batch.req_to_token_pool.req_to_sparse_k1_token[
+                            batch.req_pool_indices[i], k1_idx
+                        ].item()
+                        if slot_val != 0:
+                            k1_slots_to_free.append(slot_val)
+                        # Zero out the entry
+                        batch.req_to_token_pool.req_to_sparse_k1_token[
+                            batch.req_pool_indices[i], k1_idx
+                        ] = 0
+
+                # k2: free rejected entries and zero them
+                for d in self._sparse_k2_draft_offsets[i]:
+                    if d > acc_len:
+                        pos = sl + d + 1
+                        k2_idx = (pos - k2_kernel_size) // k2_kernel_stride
+                        slot_val = batch.req_to_token_pool.req_to_sparse_k2_token[
+                            batch.req_pool_indices[i], k2_idx
+                        ].item()
+                        if slot_val != 0:
+                            k2_slots_to_free.append(slot_val)
+                        batch.req_to_token_pool.req_to_sparse_k2_token[
+                            batch.req_pool_indices[i], k2_idx
+                        ] = 0
+
+            if k1_slots_to_free:
+                token_to_kv_pool_allocator.free(
+                    torch.tensor(k1_slots_to_free, dtype=torch.int64, device=batch.device)
+                )
+            if k2_slots_to_free:
+                token_to_kv_pool_allocator.free(
+                    torch.tensor(k2_slots_to_free, dtype=torch.int64, device=batch.device)
                 )
 
         # Construct EagleVerifyOutput

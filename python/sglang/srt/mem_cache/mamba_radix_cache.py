@@ -494,7 +494,11 @@ class MambaRadixCache(BasePrefixCache):
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
 
-            if hasattr(self.req_to_token_pool, 'kernel_size') and hasattr(self.req_to_token_pool, 'kernel_stride'):
+            if (
+                self.page_size == 1
+                and hasattr(self.req_to_token_pool, 'kernel_size')
+                and hasattr(self.req_to_token_pool, 'kernel_stride')
+            ):
                 kernel_size = self.req_to_token_pool.kernel_size
                 kernel_stride = self.req_to_token_pool.kernel_stride
                 k1_kernel_size = kernel_size
@@ -506,14 +510,20 @@ class MambaRadixCache(BasePrefixCache):
                 k1_freed = 0
                 if k1_committed_len > 0:
                     k1_indices = self.req_to_token_pool.req_to_sparse_k1_token[req.req_pool_idx, :k1_committed_len]
-                    self.token_to_kv_pool_allocator.free(k1_indices)
+                    # Filter out unallocated slots (value 0 = padding) to avoid
+                    # double-freeing the pad slot under speculative decode.
+                    k1_indices = k1_indices[k1_indices != 0]
+                    if k1_indices.numel() > 0:
+                        self.token_to_kv_pool_allocator.free(k1_indices)
                     k1_freed = k1_indices.numel()
 
                 k2_committed_len = (kv_committed_len - k2_kernel_size) // k2_kernel_stride + 1 if kv_committed_len >= k2_kernel_size else 0
                 k2_freed = 0
                 if k2_committed_len > 0:
                     k2_indices = self.req_to_token_pool.req_to_sparse_k2_token[req.req_pool_idx, :k2_committed_len]
-                    self.token_to_kv_pool_allocator.free(k2_indices)
+                    k2_indices = k2_indices[k2_indices != 0]
+                    if k2_indices.numel() > 0:
+                        self.token_to_kv_pool_allocator.free(k2_indices)
                     k2_freed = k2_indices.numel()
 
             self.req_to_token_pool.free(req.req_pool_idx)
@@ -583,7 +593,11 @@ class MambaRadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
             mamba_exist = True
 
-        if hasattr(self.req_to_token_pool, 'kernel_size') and hasattr(self.req_to_token_pool, 'kernel_stride'):
+        if (
+            self.page_size == 1
+            and hasattr(self.req_to_token_pool, 'kernel_size')
+            and hasattr(self.req_to_token_pool, 'kernel_stride')
+        ):
             kernel_size = self.req_to_token_pool.kernel_size
             kernel_stride = self.req_to_token_pool.kernel_stride
             k1_kernel_size = kernel_size
@@ -594,12 +608,16 @@ class MambaRadixCache(BasePrefixCache):
             k1_committed_len = (kv_committed_len - k1_kernel_size) // k1_kernel_stride + 1 if kv_committed_len >= k1_kernel_size else 0
             if k1_committed_len > 0:
                 k1_indices = self.req_to_token_pool.req_to_sparse_k1_token[req.req_pool_idx, :k1_committed_len]
-                self.token_to_kv_pool_allocator.free(k1_indices)
+                k1_indices = k1_indices[k1_indices != 0]
+                if k1_indices.numel() > 0:
+                    self.token_to_kv_pool_allocator.free(k1_indices)
 
             k2_committed_len = (kv_committed_len - k2_kernel_size) // k2_kernel_stride + 1 if kv_committed_len >= k2_kernel_size else 0
             if k2_committed_len > 0:
                 k2_indices = self.req_to_token_pool.req_to_sparse_k2_token[req.req_pool_idx, :k2_committed_len]
-                self.token_to_kv_pool_allocator.free(k2_indices)
+                k2_indices = k2_indices[k2_indices != 0]
+                if k2_indices.numel() > 0:
+                    self.token_to_kv_pool_allocator.free(k2_indices)
 
         if mamba_exist:
             mamba_ping_pong_track_buffer_to_keep = None

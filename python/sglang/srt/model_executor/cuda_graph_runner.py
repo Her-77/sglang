@@ -348,12 +348,17 @@ class CudaGraphRunner:
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
-        # Speculative_inference
+        # Speculative_inference — B43 fix: pass actual layer_ids (not default 3)
+        # set_eagle3_layers_to_capture is already called in model_runner.py with correct ids
+        # Only call here if not already set (defensive)
         if (
             model_runner.spec_algorithm.is_eagle3()
             and model_runner.eagle_use_aux_hidden_state
+            and not getattr(self.model_runner.model, 'capture_aux_hidden_states', False)
         ):
-            self.model_runner.model.set_eagle3_layers_to_capture()
+            self.model_runner.model.set_eagle3_layers_to_capture(
+                getattr(model_runner, 'eagle_aux_hidden_state_layer_ids', None)
+            )
 
         # Capture
         try:

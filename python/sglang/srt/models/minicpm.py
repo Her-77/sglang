@@ -535,6 +535,8 @@ class MiniCPMModel(nn.Module):
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layers_to_capture = []
+        self._aux_capture_indices = []  # B43: pre-computed capture indices
 
     def forward(
         self,
@@ -549,7 +551,23 @@ class MiniCPMModel(nn.Module):
             hidden_states = input_embeds
         residual = None
 
+        # B43 CG fix: use in-place tensor ops for aux states (CUDA graph compatible)
+        # _aux_capture_indices maps layer index → capture slot index
+        capture_indices = self._aux_capture_indices
+        num_capture = len(capture_indices)
+
+        if num_capture > 0:
+            # Allocate per-forward (CG will capture the allocation and reuse memory)
+            aux_tensor = torch.empty(
+                (num_capture, hidden_states.shape[0], hidden_states.shape[-1]),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+
         for i in range(len(self.layers)):
+            # Use pre-computed dict lookup (still Python, but the copy_ is CUDA)
+            if i in capture_indices:
+                aux_tensor[capture_indices[i]].copy_(hidden_states)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -558,7 +576,11 @@ class MiniCPMModel(nn.Module):
                 residual,
             )
         hidden_states = self.norm(hidden_states)
-        return hidden_states
+
+        if num_capture == 0:
+            return hidden_states
+        # Return as list of tensor views for logits_processor compatibility
+        return hidden_states, [aux_tensor[j] for j in range(num_capture)]
 
 
 class MiniCPMSALAForCausalLM(nn.Module):
@@ -588,6 +610,7 @@ class MiniCPMSALAForCausalLM(nn.Module):
         self.scale_width = self.config.hidden_size / self.config.dim_model_base
 
         self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
 
     @torch.no_grad()
     def forward(
@@ -600,12 +623,64 @@ class MiniCPMSALAForCausalLM(nn.Module):
         if input_embeds is not None:
             input_embeds = input_embeds * self.config.scale_emb
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         hidden_states = hidden_states / self.scale_width
         if self.config.tie_word_embeddings:
             lm_head = self.model.embed_tokens
         else:
             lm_head = self.lm_head
-        return self.logits_processor(input_ids, hidden_states, lm_head, forward_batch)
+        return self.logits_processor(
+            input_ids, hidden_states, lm_head, forward_batch, aux_hidden_states
+        )
+
+    # ---- EAGLE3 embed / head sharing interface ----
+
+    def get_embed_and_head(self):
+        if self.config.tie_word_embeddings:
+            return self.model.embed_tokens.weight, self.model.embed_tokens.weight
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        self.model.embed_tokens.weight = embed
+        if not self.config.tie_word_embeddings:
+            del self.lm_head.weight
+            self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    def get_embed(self):
+        return self.model.embed_tokens.weight
+
+    def set_embed(self, embed):
+        if (
+            hasattr(self.config, "target_hidden_size")
+            and self.config.target_hidden_size != self.config.hidden_size
+        ):
+            return
+        del self.model.embed_tokens.weight
+        self.model.embed_tokens.weight = embed
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    def set_eagle3_layers_to_capture(self, layer_ids=None):
+        if layer_ids is None:
+            self.capture_aux_hidden_states = True
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            self.capture_aux_hidden_states = True
+            # plus 1: for the ith layer, we take the output of the (i-1)th layer
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        # B43: pre-compute capture_indices dict for CG-friendly lookup
+        self.model._aux_capture_indices = {
+            layer_idx: slot_idx
+            for slot_idx, layer_idx in enumerate(self.model.layers_to_capture)
+        }
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

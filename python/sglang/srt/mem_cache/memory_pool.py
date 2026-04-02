@@ -568,9 +568,37 @@ class MiniCPMReqToTokenPool(ReqToTokenPool):
             )
 
     def write_sparse_k1(self, indices, values):
+        if isinstance(indices, tuple) and len(indices) == 2 and isinstance(indices[1], slice):
+            s = indices[1]
+            k1_dim = self.req_to_sparse_k1_token.shape[1]
+            start = s.start if s.start is not None else 0
+            stop = s.stop if s.stop is not None else k1_dim
+            if stop > k1_dim:
+                logger.warning(
+                    f"write_sparse_k1: slice end {stop} exceeds k1 dim {k1_dim}, clamping"
+                )
+                stop = k1_dim
+                indices = (indices[0], slice(start, stop))
+                values = values[:stop - start]
+            if start >= k1_dim or start >= stop:
+                return
         self.req_to_sparse_k1_token[indices] = values
 
     def write_sparse_k2(self, indices, values):
+        if isinstance(indices, tuple) and len(indices) == 2 and isinstance(indices[1], slice):
+            s = indices[1]
+            k2_dim = self.req_to_sparse_k2_token.shape[1]
+            start = s.start if s.start is not None else 0
+            stop = s.stop if s.stop is not None else k2_dim
+            if stop > k2_dim:
+                logger.warning(
+                    f"write_sparse_k2: slice end {stop} exceeds k2 dim {k2_dim}, clamping"
+                )
+                stop = k2_dim
+                indices = (indices[0], slice(start, stop))
+                values = values[:stop - start]
+            if start >= k2_dim or start >= stop:
+                return
         self.req_to_sparse_k2_token[indices] = values
 
 
@@ -632,11 +660,61 @@ class MiniCPMHybridReqToTokenPool(HybridReqToTokenPool):
 
     def write_sparse_k1(self, indices, values):
         if self.req_to_sparse_k1_token is not None:
+            # Bounds check: clamp the slice end to the k1 dimension size
+            # to prevent out-of-bounds writes during speculative decode
+            if isinstance(indices, tuple) and len(indices) == 2 and isinstance(indices[1], slice):
+                s = indices[1]
+                k1_dim = self.req_to_sparse_k1_token.shape[1]
+                start = s.start if s.start is not None else 0
+                stop = s.stop if s.stop is not None else k1_dim
+                if stop > k1_dim:
+                    logger.warning(
+                        f"write_sparse_k1: slice end {stop} exceeds k1 dim {k1_dim}, clamping"
+                    )
+                    stop = k1_dim
+                    indices = (indices[0], slice(start, stop))
+                    values = values[:stop - start]
+                if start >= k1_dim or start >= stop:
+                    return
             self.req_to_sparse_k1_token[indices] = values
 
     def write_sparse_k2(self, indices, values):
         if self.req_to_sparse_k2_token is not None:
+            # Bounds check: clamp the slice end to the k2 dimension size
+            if isinstance(indices, tuple) and len(indices) == 2 and isinstance(indices[1], slice):
+                s = indices[1]
+                k2_dim = self.req_to_sparse_k2_token.shape[1]
+                start = s.start if s.start is not None else 0
+                stop = s.stop if s.stop is not None else k2_dim
+                if stop > k2_dim:
+                    logger.warning(
+                        f"write_sparse_k2: slice end {stop} exceeds k2 dim {k2_dim}, clamping"
+                    )
+                    stop = k2_dim
+                    indices = (indices[0], slice(start, stop))
+                    values = values[:stop - start]
+                if start >= k2_dim or start >= stop:
+                    return
             self.req_to_sparse_k2_token[indices] = values
+
+    def free(
+        self,
+        free_index: Union[int, List[int]],
+        free_mamba_cache: bool = True,
+        mamba_ping_pong_track_buffer_to_keep: Optional[int] = None,
+    ):
+        # 清零释放的 req_pool_idx 对应的 sparse k1/k2 数组行，
+        # 防止 req_pool_idx 被新请求复用时读到旧的 stale sparse indices
+        if self.req_to_sparse_k1_token is not None:
+            self.req_to_sparse_k1_token[free_index] = 0
+        if self.req_to_sparse_k2_token is not None:
+            self.req_to_sparse_k2_token[free_index] = 0
+
+        super().free(
+            free_index,
+            free_mamba_cache=free_mamba_cache,
+            mamba_ping_pong_track_buffer_to_keep=mamba_ping_pong_track_buffer_to_keep,
+        )
 
     def clear(self):
         super().clear()

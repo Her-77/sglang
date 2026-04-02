@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.utils.common import ceil_align, raise_error_or_warn
@@ -326,6 +327,31 @@ class SchedulerRuntimeCheckerMixin:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
             if queue_size:
                 return
+
+        # When speculative decode is active and the server is truly idle
+        # (no running requests, no waiting requests), forcibly reset the
+        # token_to_kv_pool_allocator to recover any leaked tokens.
+        # This handles a known issue where the spec-decode draft/verify
+        # allocation cycle can leave a small number of tokens unreturned
+        # (typically ~chunked_prefill_size tokens).
+        # Only applies to ChunkCache (no radix prefix caching), because
+        # resetting the allocator would invalidate radix tree entries.
+        if (
+            not self.spec_algorithm.is_none()
+            and isinstance(self.tree_cache, ChunkCache)
+            and self.running_batch.is_empty()
+            and len(self.waiting_queue) == 0
+        ):
+            available = self.token_to_kv_pool_allocator.available_size()
+            expected = self.max_total_num_tokens - self.tree_cache.protected_size()
+            if available != expected:
+                leaked = expected - available
+                logger.warning(
+                    f"Speculative decode idle: resetting allocator to recover "
+                    f"{leaked} leaked tokens "
+                    f"(available={available}, expected={expected})"
+                )
+                self.token_to_kv_pool_allocator.clear()
 
         self.check_memory()
         self.check_tree_cache()

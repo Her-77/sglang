@@ -1688,10 +1688,24 @@ class ServerArgs:
             or self.decode_attention_backend == "trtllm_mha"
             or self.prefill_attention_backend == "trtllm_mha"
         ):
-            if not is_sm100_supported():
-                raise ValueError(
-                    "TRTLLM MHA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
-                )
+            # Decode: allow SM120 (Blackwell RTX) per upstream main (issue #9140)
+            # Prefill: still require SM100
+            _is_decode_only_trtllm = (
+                self.decode_attention_backend == "trtllm_mha"
+                and self.attention_backend != "trtllm_mha"
+                and self.prefill_attention_backend != "trtllm_mha"
+            )
+            if _is_decode_only_trtllm:
+                if not (is_sm100_supported() or is_sm120_supported()):
+                    raise ValueError(
+                        "TRTLLM MHA decode backend requires Blackwell GPU (SM100 or SM120)."
+                    )
+            else:
+                if not is_sm100_supported():
+                    raise ValueError(
+                        "TRTLLM MHA backend (full or prefill) is only supported on SM100 GPUs. "
+                        "Use --decode-attention-backend trtllm_mha for SM120."
+                    )
 
             if self.page_size not in [16, 32, 64]:
                 logger.warning(

@@ -1611,7 +1611,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 HybridAttnBackend,
             )
 
-            attn_backend = HybridAttnBackend(
+            hybrid_decode_prefill = HybridAttnBackend(
                 self,
                 decode_backend=self._get_attention_backend_from_str(
                     self.decode_attention_backend_str,
@@ -1622,6 +1622,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     init_new_workspace=init_new_workspace,
                 ),
             )
+            # For hybrid GLA/attention models (e.g., MiniCPM-SALA), wrap the
+            # decode/prefill composite backend through attn_backend_wrapper so
+            # HybridLinearAttnBackend is the outer layer and GLA layers route
+            # correctly.
+            attn_backend = attn_backend_wrapper(self, hybrid_decode_prefill)
             logger.info(
                 f"Using hybrid attention backend for decode and prefill: "
                 f"decode_backend={self.decode_attention_backend_str}, "

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -37,9 +38,11 @@ from sglang.srt.layers.quantization.fp8_utils import (
     is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.marlin_utils import apply_gptq_marlin_linear
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
+    get_scalar_types,
     is_layer_skipped,
     per_tensor_dequantize,
     prepare_static_weights_for_trtllm_fp4_moe,
@@ -151,6 +154,32 @@ CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
 # TODO make it true by default when the DeepEP PR is merged
 MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
 FLASHINFER_FP4_GEMM_BACKEND = envs.SGLANG_FLASHINFER_FP4_GEMM_BACKEND.get()
+
+# ---- Dual-weight mode: NVFP4 for prefill (extend), Marlin WNA16 for decode ----
+DUAL_WEIGHT_MARLIN_PATH = ""
+DUAL_WEIGHT_ENABLED = False
+DUAL_WEIGHT_NUM_BITS = int(os.environ.get("SGLANG_DUAL_WEIGHT_NUM_BITS", "4"))
+_current_forward_mode = 0  # 0 = extend (FP4), 1 = decode (Marlin)
+
+
+def set_forward_mode_decode():
+    global _current_forward_mode
+    _current_forward_mode = 1
+
+
+def set_forward_mode_extend():
+    global _current_forward_mode
+    _current_forward_mode = 0
+
+
+def set_dual_weight_marlin_path(path: str):
+    global DUAL_WEIGHT_MARLIN_PATH, DUAL_WEIGHT_ENABLED
+    DUAL_WEIGHT_MARLIN_PATH = path or ""
+    DUAL_WEIGHT_ENABLED = bool(DUAL_WEIGHT_MARLIN_PATH)
+
+
+set_dual_weight_marlin_path(os.environ.get("SGLANG_DUAL_WEIGHT_MARLIN_PATH", ""))
+
 # Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
 
@@ -1208,6 +1237,29 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         x_m, _ = x.shape
         w_n, _ = layer.weight.shape
         output_shape = [x_m, w_n]
+
+        # Dual-weight dispatch: decode mode → Marlin WNA16 GEMM
+        if (
+            DUAL_WEIGHT_ENABLED
+            and _current_forward_mode == 1
+            and getattr(layer, "has_marlin_weights", False)
+        ):
+            _, _scalar_types = get_scalar_types()
+            _wtype = _scalar_types.uint8b128 if DUAL_WEIGHT_NUM_BITS == 8 else _scalar_types.uint4b8
+            return apply_gptq_marlin_linear(
+                input=x,
+                weight=layer.marlin_qweight,
+                weight_scale=layer.marlin_scales,
+                weight_zp=layer.marlin_zp,
+                g_idx=layer.marlin_g_idx,
+                g_idx_sort_indices=layer.marlin_g_idx_sort_indices,
+                workspace=layer.marlin_workspace,
+                wtype=_wtype,
+                output_size_per_partition=layer.marlin_output_size,
+                input_size_per_partition=layer.marlin_input_size,
+                is_k_full=True,
+                bias=bias,
+            )
 
         # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
         x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)

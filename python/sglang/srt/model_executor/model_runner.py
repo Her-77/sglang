@@ -378,6 +378,32 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
 
+        # ---- Dual-weight (Route B): NVFP4 prefill + GPTQ decode ----
+        dual_weight_path = os.environ.get("SGLANG_DUAL_WEIGHT_MARLIN_PATH", "")
+        if dual_weight_path and not os.path.isdir(dual_weight_path):
+            logger.warning(
+                "Dual-weight: env path %s does not exist, falling back to auto-detect",
+                dual_weight_path,
+            )
+            dual_weight_path = ""
+        if not dual_weight_path:
+            candidate = os.path.join(
+                self.server_args.model_path, "routeb_decode_w4a16"
+            )
+            if os.path.isdir(candidate):
+                dual_weight_path = candidate
+                logger.info(
+                    "Dual-weight: auto-detected decode weights at %s", dual_weight_path
+                )
+
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            set_dual_weight_marlin_path,
+        )
+
+        set_dual_weight_marlin_path(dual_weight_path)
+        self._dual_weight_marlin_path = dual_weight_path
+        self._dual_weight_enabled = bool(dual_weight_path)
+
         # Initialize the model runner
         self.initialize(min_per_gpu_memory)
         self.check_quantized_moe_compatibility()
@@ -572,7 +598,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.init_cublas()
             self.init_attention_backend()
             self.kernel_warmup()
+            # Dual-weight: set decode mode before CUDA graph capture
+            # so Marlin kernels are captured in decode graphs
+            if self._dual_weight_enabled:
+                from sglang.srt.layers.quantization.modelopt_quant import (
+                    set_forward_mode_decode,
+                    set_forward_mode_extend,
+                )
+                set_forward_mode_decode()
             self.init_device_graphs()
+            if self._dual_weight_enabled:
+                set_forward_mode_extend()
         elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
             self.init_device_graphs()
@@ -893,6 +929,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         monkey_patch_vllm_parallel_state(reverse=True)
 
         get_offloader().post_init()
+
+        # Dual-weight: load Marlin W4A16 weights for decode path
+        if self._dual_weight_marlin_path:
+            from sglang.srt.layers.quantization.dual_weight_loader import (
+                load_marlin_weights_onto_fp4_model,
+            )
+
+            n_layers = load_marlin_weights_onto_fp4_model(
+                self.model, self._dual_weight_marlin_path, self.device
+            )
+            logger.info(
+                "Dual-weight: loaded Marlin W4A16 from %s (%d layers)",
+                self._dual_weight_marlin_path,
+                n_layers,
+            )
 
         # Register model for layerwise NVTX profiling if enabled
         if self.server_args.enable_layerwise_nvtx_marker:

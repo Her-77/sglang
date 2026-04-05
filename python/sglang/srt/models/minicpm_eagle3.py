@@ -468,6 +468,11 @@ class MiniCPMSALAForCausalLMEagle3(nn.Module):
                 self.hot_token_id = loaded_weight + torch.arange(
                     loaded_weight.shape[0]
                 )
+                import logging
+                logging.getLogger(__name__).info(
+                    f"[MiniCPM-EAGLE3] Loaded d2t mapping: shape={loaded_weight.shape}, "
+                    f"hot_token_id range=[{self.hot_token_id.min()}, {self.hot_token_id.max()}]"
+                )
                 continue
             if "t2d" in name:
                 continue

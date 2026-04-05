@@ -2170,6 +2170,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        # Dual-weight (Route B): set decode mode → Marlin W4A16 GEMM
+        if self._dual_weight_enabled:
+            from sglang.srt.layers.quantization.modelopt_quant import (
+                set_forward_mode_decode,
+            )
+            set_forward_mode_decode()
+
         if not skip_attn_backend_init:
             if self.server_args.enable_pdmux:
                 self.decode_attn_backend.init_forward_metadata(forward_batch)
@@ -2193,6 +2200,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
+        # Dual-weight (Route B): set extend mode → NVFP4 GEMM
+        if self._dual_weight_enabled:
+            from sglang.srt.layers.quantization.modelopt_quant import (
+                set_forward_mode_extend,
+            )
+            set_forward_mode_extend()
+
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors

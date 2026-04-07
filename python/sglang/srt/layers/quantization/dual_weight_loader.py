@@ -91,10 +91,12 @@ def load_marlin_weights_onto_fp4_model(
         quant_method = getattr(module, "quant_method", None)
         if quant_method is None:
             continue
-        # Accept both NVFP4 layers and unquantized layers (e.g., minicpm4 attention
-        # layers protected by NVFP4 ignore list). Both benefit from Marlin decode.
-        _ACCEPTED_METHODS = {"ModelOptFp4LinearMethod", "UnquantizedLinearMethod"}
-        if quant_method.__class__.__name__ not in _ACCEPTED_METHODS:
+        # Only accept NVFP4 layers for Marlin decode dispatch.
+        # UnquantizedLinearMethod layers (minicpm4 attention, protected by NVFP4 ignore
+        # list) must stay BF16: prefill generates KV cache with BF16 weights, and
+        # W4A16 decode Q vectors cause precision loss (-6 to -12pp) due to distribution
+        # mismatch with NVFP4-generated KV cache.
+        if quant_method.__class__.__name__ != "ModelOptFp4LinearMethod":
             continue
 
         # Determine safetensors key prefix

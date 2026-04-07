@@ -91,7 +91,10 @@ def load_marlin_weights_onto_fp4_model(
         quant_method = getattr(module, "quant_method", None)
         if quant_method is None:
             continue
-        if quant_method.__class__.__name__ != "ModelOptFp4LinearMethod":
+        # Accept both NVFP4 layers and unquantized layers (e.g., minicpm4 attention
+        # layers protected by NVFP4 ignore list). Both benefit from Marlin decode.
+        _ACCEPTED_METHODS = {"ModelOptFp4LinearMethod", "UnquantizedLinearMethod"}
+        if quant_method.__class__.__name__ not in _ACCEPTED_METHODS:
             continue
 
         # Determine safetensors key prefix
@@ -148,12 +151,105 @@ def load_marlin_weights_onto_fp4_model(
     # Cleanup file handles
     file_cache.clear()
 
+    # Install forward hooks on nn.Linear layers that got Marlin weights
+    # (these are unquantized layers that bypass SGLang's LinearBase dispatch)
+    hook_count = _install_marlin_decode_hooks(model)
+
     total_mb = total_bytes / 1024**2
     logger.info(
         f"Dual-weight: loaded Marlin W{DUAL_WEIGHT_NUM_BITS}A16 weights for {count} layers, "
         f"total {total_mb:.1f} MB ({total_mb / 1024:.2f} GB)"
     )
+    if hook_count > 0:
+        logger.info(
+            f"Dual-weight: installed Marlin decode hooks on {hook_count} nn.Linear layers"
+        )
     return count
+
+
+def _install_marlin_decode_hooks(model: torch.nn.Module) -> int:
+    """Monkey-patch nn.Linear.forward on layers with Marlin weights.
+
+    For layers loaded via trust_remote_code (using raw nn.Linear instead of
+    SGLang's LinearBase), the normal quant_method.apply() dispatch is bypassed.
+    This replaces forward() to dispatch to Marlin GEMM during decode mode.
+    """
+    import types
+
+    from sglang.srt.layers.quantization.marlin_utils import apply_gptq_marlin_linear
+
+    try:
+        from sgl_kernel.scalar_type import scalar_types
+    except ImportError:
+        return 0
+
+    _wtype = (
+        scalar_types.uint8b128
+        if DUAL_WEIGHT_NUM_BITS == 8
+        else scalar_types.uint4b8
+    )
+
+    hook_count = 0
+    # Debug: count candidates
+    candidates = []
+    for n, m in model.named_modules():
+        if not getattr(m, "has_marlin_weights", False):
+            continue
+        qm = getattr(m, "quant_method", None)
+        qm_name = qm.__class__.__name__ if qm else "None"
+        if qm_name != "ModelOptFp4LinearMethod":
+            candidates.append((n, type(m).__name__, qm_name))
+    logger.info(f"Dual-weight hooks: {len(candidates)} candidate layers for forward patch")
+    for n, cls, qm in candidates[:5]:
+        logger.info(f"  candidate: {n} ({cls}, quant={qm})")
+
+    for name, module in model.named_modules():
+        if not getattr(module, "has_marlin_weights", False):
+            continue
+        # Skip if already handled by ModelOptFp4LinearMethod dispatch
+        qm = getattr(module, "quant_method", None)
+        if qm is not None and qm.__class__.__name__ == "ModelOptFp4LinearMethod":
+            continue
+        # Only patch modules with a forward that does F.linear or equivalent
+        if not hasattr(module, "forward"):
+            continue
+
+        # Save original forward
+        module._original_forward = module.forward
+
+        def _dual_forward(self, x):
+            """Dispatch to Marlin GEMM in decode mode, original BF16 in extend."""
+            import sglang.srt.layers.quantization.modelopt_quant as _mqm
+
+            if _mqm._current_forward_mode == 1:
+                if not getattr(_dual_forward, '_logged', False):
+                    logger.info("Dual-weight: Marlin decode hook FIRED (first call)")
+                    _dual_forward._logged = True
+                bias = self.bias if not getattr(self, "skip_bias_add", False) else None
+                out = apply_gptq_marlin_linear(
+                    input=x,
+                    weight=self.marlin_qweight,
+                    weight_scale=self.marlin_scales,
+                    weight_zp=self.marlin_zp,
+                    g_idx=self.marlin_g_idx,
+                    g_idx_sort_indices=self.marlin_g_idx_sort_indices,
+                    workspace=self.marlin_workspace,
+                    wtype=_wtype,
+                    output_size_per_partition=self.marlin_output_size,
+                    input_size_per_partition=self.marlin_input_size,
+                    is_k_full=True,
+                    bias=bias,
+                )
+                # SGLang LinearBase.forward() returns (output, output_bias) tuple
+                output_bias = self.bias if getattr(self, "skip_bias_add", False) else None
+                return out, output_bias
+            return self._original_forward(x)
+
+        module.forward = types.MethodType(_dual_forward, module)
+        hook_count += 1
+        logger.debug(f"Dual-weight: patched forward on {name}")
+
+    return hook_count
 
 
 def _load_fused_weights(

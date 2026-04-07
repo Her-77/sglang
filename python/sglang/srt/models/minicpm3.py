@@ -311,8 +311,6 @@ class MiniCPM3DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        # Precompute scale factor to avoid repeated division
-        self.scale_factor = config.scale_depth / math.sqrt(config.num_hidden_layers)
 
     def forward(
         self,
@@ -321,28 +319,27 @@ class MiniCPM3DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention — fused residual add + layernorm
-        # First layer: residual is None, just do plain rmsnorm
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        # Self Attention
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        hidden_states.mul_(self.scale_factor)
-
-        # MLP — fused residual add + layernorm
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual
+        hidden_states = residual + hidden_states * (
+            self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
         )
-        hidden_states = self.mlp(hidden_states)
-        hidden_states.mul_(self.scale_factor)
 
-        return hidden_states, residual
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states * (
+            self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
+        )
+
+        return hidden_states, None
 
 
 class MiniCPM3Model(nn.Module):
@@ -396,8 +393,7 @@ class MiniCPM3Model(nn.Module):
                 forward_batch,
                 residual,
             )
-        # Final norm: fuse last layer's residual addition
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = self.norm(hidden_states)
         return hidden_states
 
 

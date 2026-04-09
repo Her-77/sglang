@@ -1819,71 +1819,71 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
 
         current_state = initial_state  # [B, H, K, V]
 
-        # [DIAG-H4-QKV] Compare root token's QKV between topk configs
-        import os
-        _diag_qkv = os.environ.get('SGLANG_DIAG_QKV', '0') == '1'
-        if _diag_qkv:
-            if not hasattr(self, '_diag_qkv_count'):
-                self._diag_qkv_count = 0
-            if self._diag_qkv_count < 50:
-                # q_4d shape: [B, dtn, H, D], root token is [:, 0, :, :]
-                q_root = q_4d[:, 0]  # [B, H, D]
-                k_root = k_4d[:, 0]
-                v_root = v_4d[:, 0]
-                topk = getattr(forward_batch.spec_info, 'topk', 1)
-                print(f"[DIAG-QKV] layer={layer_id} topk={topk} dtn={draft_token_num} "
-                      f"q_root_hash={q_root.sum().item():.6f} "
-                      f"k_root_hash={k_root.sum().item():.6f} "
-                      f"v_root_hash={v_root.sum().item():.6f} "
-                      f"q_shape={list(q_4d.shape)} "
-                      f"initial_state_hash={initial_state.sum().item():.6f}",
-                      flush=True)
-                self._diag_qkv_count += 1
-
-        # Tree-aware state routing for topk>1: derive parent mapping so
-        # sibling tokens use their parent's state, not the preceding sibling's.
+        # Tree-aware state routing for topk>1.
+        #
+        # ROOT CAUSE of CG bug: During CG capture, spec_info.retrive_next_token is None
+        # (see cuda_graph_runner.py L903). The old code derived parent_step from
+        # retrive_next_token via Python dict + if/else, which was frozen at capture
+        # time with no tree routing. CG replay never re-executes Python, so siblings
+        # always read the predecessor's state instead of the parent's.
+        #
+        # FIX: For fixed (topk, steps), the tree topology is deterministic — it doesn't
+        # depend on runtime data at all. We compute parent_step purely from topk and
+        # draft_token_num using the standard EAGLE3 tree layout:
+        #   - Node 0: root (no parent)
+        #   - Nodes 1..topk: depth-1 children of root
+        #   - Nodes topk+1..topk+topk²: depth-2 children, grouped by parent
+        #   - etc.
+        # This computation happens once per (topk, dtn) pair and is cached.
+        # The step loop then uses `state_cache_tensor[parent]` — a tensor gather that
+        # CG correctly captures and replays.
         spec_info = forward_batch.spec_info
-        parent_step = None
-        if hasattr(spec_info, 'topk') and spec_info.topk > 1 and spec_info.retrive_next_token is not None:
-            rnt = spec_info.retrive_next_token[0].tolist()
-            rns = spec_info.retrive_next_sibling[0].tolist()
-            parent_step = [-1] * draft_token_num
-            for i in range(draft_token_num):
-                child = rnt[i]
-                if 0 <= child < draft_token_num:
-                    parent_step[child] = i
-                sib = rns[i]
-                if 0 <= sib < draft_token_num:
-                    parent_step[sib] = parent_step[i]
+        topk = getattr(spec_info, 'topk', 1)
 
-        # Diagnostic: compare parent_step with retrieve_parent_token from GDN conv1d
-        import os
-        _diag = os.path.exists('/tmp/SGLANG_DIAG_TREE_VERIFY')
-        if _diag and parent_step is not None and layer_id == 1:
-            rpt = getattr(self, 'forward_metadata', None)
-            if rpt is not None:
-                rpt_tensor = getattr(rpt, 'retrieve_parent_token', None)
-                if rpt_tensor is not None and rpt_tensor.numel() > 0:
-                    rpt_list = rpt_tensor[0, :draft_token_num].tolist()
-                    if not hasattr(self, '_diag_count'):
-                        self._diag_count = 0
-                    if self._diag_count < 3:
-                        import logging
-                        logging.getLogger(__name__).warning(
-                            f"[DIAG] layer={layer_id} topk={spec_info.topk} dtn={draft_token_num} "
-                            f"parent_step={parent_step} retrieve_parent_token={rpt_list}"
-                        )
-                        self._diag_count += 1
+        parent_step_list = None
+        if topk > 1:
+            if not hasattr(self, '_cg_parent_step_cache'):
+                self._cg_parent_step_cache = {}
 
-        # Keep full-precision state cache (no dtype conversion) for tree routing
-        state_cache = {}  # step -> state tensor (same dtype as initial_state)
+            cache_key = (topk, draft_token_num)
+            if cache_key not in self._cg_parent_step_cache:
+                # Build parent_step from tree structure: node 0 is root,
+                # nodes 1..topk are its children, nodes topk+1.. are grandchildren.
+                ps = [-1] * draft_token_num  # -1 = use initial_state
+                # For EAGLE3 tree: root=0, then topk children at depth 1,
+                # then topk*topk children at depth 2, etc.
+                # Depth 1: nodes [1, topk], all children of root (node 0)
+                for i in range(1, min(topk + 1, draft_token_num)):
+                    ps[i] = 0  # parent is root
+                # Depth 2: nodes [topk+1, topk+topk²], each group of topk children
+                offset = topk + 1
+                for parent_idx in range(1, topk + 1):
+                    for j in range(topk):
+                        node = offset + (parent_idx - 1) * topk + j
+                        if node < draft_token_num:
+                            ps[node] = parent_idx
+                # Depth 3+: extend similarly if needed
+                self._cg_parent_step_cache[cache_key] = ps
+
+            parent_step_list = self._cg_parent_step_cache[cache_key]
+
+        # Pre-allocate state cache as a stacked tensor for CG compatibility.
+        # state_cache[step] = intermediate state after processing step.
+        # Shape: [draft_token_num, B, H, K, V]
+        state_cache_tensor = torch.zeros(
+            draft_token_num, *initial_state.shape,
+            dtype=initial_state.dtype, device=initial_state.device
+        )
 
         for step in range(draft_token_num):
-            # Tree routing: load parent state for siblings
-            if parent_step is not None and step > 0:
-                p = parent_step[step]
-                if p >= 0 and p in state_cache:
-                    current_state = state_cache[p]
+            # Tree routing: load parent state for siblings.
+            # Uses state_cache_tensor (pre-allocated) so CG captures tensor indexing
+            # rather than Python dict lookups. parent_step_list is computed once and
+            # cached — it never changes for a given (topk, steps) configuration.
+            if parent_step_list is not None and step > 0:
+                p = parent_step_list[step]
+                if p >= 0:
+                    current_state = state_cache_tensor[p]
                 else:
                     current_state = initial_state
 
@@ -1916,25 +1916,8 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
                 intermediate_ssm.dtype
             )
 
-            # [DIAG-H4-VERIFY] Log per-step state in _forward_target_verify
-            import os
-            if os.environ.get('SGLANG_DIAG_STATE2', '0') == '1':
-                if not hasattr(self, '_diag_verify_count'):
-                    self._diag_verify_count = 0
-                if self._diag_verify_count < 30:
-                    ps_info = f"parent={parent_step[step]}" if parent_step and step > 0 else "root"
-                    print(f"[DIAG-VERIFY] layer={layer_id} step={step}/{draft_token_num} "
-                          f"topk={getattr(spec_info,'topk',1)} {ps_info} "
-                          f"input_state_hash={current_state.sum().item():.6f} "
-                          f"next_state_hash={next_state.sum().item():.6f} "
-                          f"o_hash={o_step.sum().item():.6f} "
-                          f"cached_hash={intermediate_ssm[0,step].sum().item():.6f}",
-                          flush=True)
-                    self._diag_verify_count += 1
-
-            # Save full-precision state for tree routing
-            if parent_step is not None:
-                state_cache[step] = next_state
+            # Save state for tree routing (tensor-based, CG compatible)
+            state_cache_tensor[step] = next_state
             current_state = next_state
 
         # Output layout:

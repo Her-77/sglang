@@ -1062,6 +1062,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
+
+            # Diagnostic: optionally disable GDN tree routing to isolate bug source
+            # Uses file flag /tmp/SGLANG_DISABLE_GDN_TREE (survives tmux)
+            import os
+            _diag_disable_gdn_tree = os.path.exists('/tmp/SGLANG_DISABLE_GDN_TREE')
+            if _diag_disable_gdn_tree and retrieve_next_token is not None:
+                retrieve_next_token = None
+                retrieve_next_sibling = None
+                retrieve_parent_token = None
+
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
@@ -1127,6 +1137,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
 
         if is_target_verify:
+            # When GDN tree is disabled, also disable for SSM path
+            _gdn_rpt = retrieve_parent_token
+            if _diag_disable_gdn_tree:
+                _gdn_rpt = None
             core_attn_out = fused_recurrent_gated_delta_rule_update(
                 q=query,
                 k=key,
@@ -1141,7 +1155,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 intermediate_states_buffer=intermediate_state_cache,
                 intermediate_state_indices=intermediate_state_indices,
                 cache_steps=forward_batch.spec_info.draft_token_num,
-                retrieve_parent_token=retrieve_parent_token,
+                retrieve_parent_token=_gdn_rpt,
             )
         else:
             # Only cuda env uses fuse ssm_states update
@@ -1462,6 +1476,21 @@ class HybridLinearAttnBackend(AttentionBackend):
             torch.int64
         )  # [N]
         last_steps = accepted_steps[valid_mask].to(torch.int64)  # [N]
+
+        # [DIAG-H4-STATE] Log state recovery details
+        import os
+        if os.environ.get('SGLANG_DIAG_STATE2', '0') == '1':
+            if not hasattr(self, '_diag_state_count'):
+                self._diag_state_count = 0
+            if self._diag_state_count < 20:
+                restored = intermediate_state_cache[:, src_state_indices, last_steps]
+                print(f"[DIAG-STATE] layer=mamba_update "
+                      f"dst={dst_state_indices.tolist()} src={src_state_indices.tolist()} "
+                      f"last_steps={last_steps.tolist()} "
+                      f"restored_hash={restored.sum().item():.6f} "
+                      f"ssm_before_hash={ssm_states[:, dst_state_indices].sum().item():.6f}",
+                      flush=True)
+                self._diag_state_count += 1
 
         # scatter into ssm_states at the chosen cache lines
         ssm_states[:, dst_state_indices, :] = intermediate_state_cache[
@@ -1790,7 +1819,74 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
 
         current_state = initial_state  # [B, H, K, V]
 
+        # [DIAG-H4-QKV] Compare root token's QKV between topk configs
+        import os
+        _diag_qkv = os.environ.get('SGLANG_DIAG_QKV', '0') == '1'
+        if _diag_qkv:
+            if not hasattr(self, '_diag_qkv_count'):
+                self._diag_qkv_count = 0
+            if self._diag_qkv_count < 50:
+                # q_4d shape: [B, dtn, H, D], root token is [:, 0, :, :]
+                q_root = q_4d[:, 0]  # [B, H, D]
+                k_root = k_4d[:, 0]
+                v_root = v_4d[:, 0]
+                topk = getattr(forward_batch.spec_info, 'topk', 1)
+                print(f"[DIAG-QKV] layer={layer_id} topk={topk} dtn={draft_token_num} "
+                      f"q_root_hash={q_root.sum().item():.6f} "
+                      f"k_root_hash={k_root.sum().item():.6f} "
+                      f"v_root_hash={v_root.sum().item():.6f} "
+                      f"q_shape={list(q_4d.shape)} "
+                      f"initial_state_hash={initial_state.sum().item():.6f}",
+                      flush=True)
+                self._diag_qkv_count += 1
+
+        # Tree-aware state routing for topk>1: derive parent mapping so
+        # sibling tokens use their parent's state, not the preceding sibling's.
+        spec_info = forward_batch.spec_info
+        parent_step = None
+        if hasattr(spec_info, 'topk') and spec_info.topk > 1 and spec_info.retrive_next_token is not None:
+            rnt = spec_info.retrive_next_token[0].tolist()
+            rns = spec_info.retrive_next_sibling[0].tolist()
+            parent_step = [-1] * draft_token_num
+            for i in range(draft_token_num):
+                child = rnt[i]
+                if 0 <= child < draft_token_num:
+                    parent_step[child] = i
+                sib = rns[i]
+                if 0 <= sib < draft_token_num:
+                    parent_step[sib] = parent_step[i]
+
+        # Diagnostic: compare parent_step with retrieve_parent_token from GDN conv1d
+        import os
+        _diag = os.path.exists('/tmp/SGLANG_DIAG_TREE_VERIFY')
+        if _diag and parent_step is not None and layer_id == 1:
+            rpt = getattr(self, 'forward_metadata', None)
+            if rpt is not None:
+                rpt_tensor = getattr(rpt, 'retrieve_parent_token', None)
+                if rpt_tensor is not None and rpt_tensor.numel() > 0:
+                    rpt_list = rpt_tensor[0, :draft_token_num].tolist()
+                    if not hasattr(self, '_diag_count'):
+                        self._diag_count = 0
+                    if self._diag_count < 3:
+                        import logging
+                        logging.getLogger(__name__).warning(
+                            f"[DIAG] layer={layer_id} topk={spec_info.topk} dtn={draft_token_num} "
+                            f"parent_step={parent_step} retrieve_parent_token={rpt_list}"
+                        )
+                        self._diag_count += 1
+
+        # Keep full-precision state cache (no dtype conversion) for tree routing
+        state_cache = {}  # step -> state tensor (same dtype as initial_state)
+
         for step in range(draft_token_num):
+            # Tree routing: load parent state for siblings
+            if parent_step is not None and step > 0:
+                p = parent_step[step]
+                if p >= 0 and p in state_cache:
+                    current_state = state_cache[p]
+                else:
+                    current_state = initial_state
+
             # Copy into pre-allocated contiguous staging buffers instead of
             # doing .transpose(0,1).contiguous() which allocates a new tensor.
             # q_4d[:, step] is [B, H, D]; copy into q_step_buf[0] which is [B, H, D].
@@ -1820,6 +1916,25 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
                 intermediate_ssm.dtype
             )
 
+            # [DIAG-H4-VERIFY] Log per-step state in _forward_target_verify
+            import os
+            if os.environ.get('SGLANG_DIAG_STATE2', '0') == '1':
+                if not hasattr(self, '_diag_verify_count'):
+                    self._diag_verify_count = 0
+                if self._diag_verify_count < 30:
+                    ps_info = f"parent={parent_step[step]}" if parent_step and step > 0 else "root"
+                    print(f"[DIAG-VERIFY] layer={layer_id} step={step}/{draft_token_num} "
+                          f"topk={getattr(spec_info,'topk',1)} {ps_info} "
+                          f"input_state_hash={current_state.sum().item():.6f} "
+                          f"next_state_hash={next_state.sum().item():.6f} "
+                          f"o_hash={o_step.sum().item():.6f} "
+                          f"cached_hash={intermediate_ssm[0,step].sum().item():.6f}",
+                          flush=True)
+                    self._diag_verify_count += 1
+
+            # Save full-precision state for tree routing
+            if parent_step is not None:
+                state_cache[step] = next_state
             current_state = next_state
 
         # Output layout:

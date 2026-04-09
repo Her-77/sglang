@@ -155,12 +155,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         )
 
         # Allocate and write sparse k1/k2 slots for draft tokens (verify path)
-        # In the normal decode path, prepare_for_decode + alloc_for_decode handles this.
-        # Spec decode verify allocates multiple tokens at once, so we compute which
-        # positions in [seq_len+1 .. seq_len+draft_token_num] trigger sparse k1/k2 entries.
-        # NOTE: This is only correct for topk=1 (chain speculation) where draft positions
-        # are sequential. For topk > 1 (tree speculation), the accepted tokens are compacted
-        # after verification and positions change, which would require sparse k1/k2 rewrite.
+        # Uses self.positions (logical positions from tree building) so this works
+        # for both topk=1 (chain) and topk>1 (tree) speculation.
+        # Each flat draft token d has logical position self.positions[batch_idx * dtn + d].
+        # Sparse pos = position + 1 (seq_len after appending this token).
         if (
             batch.model_config.has_sparse_attention
             and hasattr(batch.req_to_token_pool, 'req_to_sparse_k1_token')
@@ -172,15 +170,21 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             k2_kernel_stride = kernel_stride * 4
 
             seq_lens_cpu = batch.seq_lens_cpu
-            # For each request, check each draft position to see if it triggers sparse k1/k2
+            positions_cpu = self.positions.cpu()
+            dtn = self.draft_token_num
+
+            # For each request, check each draft token's position for k1/k2 triggers.
+            # With topk>1, siblings share the same position but each needs its own slot.
             token_num_sparse_k1 = []
             token_num_sparse_k2 = []
             for batch_idx in range(bs):
                 sl = seq_lens_cpu[batch_idx].item()
                 k1_count = 0
                 k2_count = 0
-                for d in range(1, self.draft_token_num + 1):
-                    pos = sl + d  # seq_len after appending d-th draft token
+                for d in range(dtn):
+                    pos = positions_cpu[batch_idx * dtn + d].item() + 1
+                    if pos <= sl:
+                        continue  # skip verified/bonus token at original seq_len
                     if pos >= kernel_size and (pos - kernel_size) % kernel_stride == 0:
                         k1_count += 1
                     if pos >= k2_kernel_size and (pos - k2_kernel_size) % k2_kernel_stride == 0:
@@ -201,34 +205,44 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 sparse_k2_loc = alloc_token_slots(batch.tree_cache, token_sum_sparse_k2)
 
             # Write sparse k1 entries into req_to_sparse_k1_token
+            # With topk>1, siblings at the same position write to the same k1_idx;
+            # the last write wins, which is acceptable since only the accepted token's
+            # entry matters after verify.
             if sparse_k1_loc is not None:
                 pt = 0
                 for i in range(bs):
                     if token_num_sparse_k1[i] > 0:
-                        seq_len = seq_lens_cpu[i].item()
-                        # Current k1 length before draft tokens
-                        k1_len = (seq_len - kernel_size) // kernel_stride + 1 if seq_len >= kernel_size else 0
-                        num_k1 = token_num_sparse_k1[i]
-                        batch.req_to_token_pool.write_sparse_k1(
-                            (batch.req_pool_indices[i], slice(k1_len, k1_len + num_k1)),
-                            sparse_k1_loc[pt : pt + num_k1].to(torch.int32),
-                        )
-                        pt += num_k1
+                        sl = seq_lens_cpu[i].item()
+                        k1_base = (sl - kernel_size) // kernel_stride + 1 if sl >= kernel_size else 0
+                        for d in range(dtn):
+                            pos = positions_cpu[i * dtn + d].item() + 1
+                            if pos <= sl:
+                                continue
+                            if pos >= kernel_size and (pos - kernel_size) % kernel_stride == 0:
+                                k1_idx = (pos - kernel_size) // kernel_stride
+                                batch.req_to_token_pool.write_sparse_k1(
+                                    (batch.req_pool_indices[i], slice(k1_idx, k1_idx + 1)),
+                                    sparse_k1_loc[pt : pt + 1].to(torch.int32),
+                                )
+                                pt += 1
 
             # Write sparse k2 entries into req_to_sparse_k2_token
             if sparse_k2_loc is not None:
                 pt = 0
                 for i in range(bs):
                     if token_num_sparse_k2[i] > 0:
-                        seq_len = seq_lens_cpu[i].item()
-                        # Current k2 length before draft tokens
-                        k2_len = (seq_len - k2_kernel_size) // k2_kernel_stride + 1 if seq_len >= k2_kernel_size else 0
-                        num_k2 = token_num_sparse_k2[i]
-                        batch.req_to_token_pool.write_sparse_k2(
-                            (batch.req_pool_indices[i], slice(k2_len, k2_len + num_k2)),
-                            sparse_k2_loc[pt : pt + num_k2].to(torch.int32),
-                        )
-                        pt += num_k2
+                        sl = seq_lens_cpu[i].item()
+                        for d in range(dtn):
+                            pos = positions_cpu[i * dtn + d].item() + 1
+                            if pos <= sl:
+                                continue
+                            if pos >= k2_kernel_size and (pos - k2_kernel_size) % k2_kernel_stride == 0:
+                                k2_idx = (pos - k2_kernel_size) // k2_kernel_stride
+                                batch.req_to_token_pool.write_sparse_k2(
+                                    (batch.req_pool_indices[i], slice(k2_idx, k2_idx + 1)),
+                                    sparse_k2_loc[pt : pt + 1].to(torch.int32),
+                                )
+                                pt += 1
 
             # Store on batch for use during verify (freeing rejected slots)
             batch.token_num_sparse_k1_cpu = torch.tensor(token_num_sparse_k1, dtype=torch.int64)
@@ -238,21 +252,23 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             batch.sparse_k1_loc = sparse_k1_loc
             batch.sparse_k2_loc = sparse_k2_loc
 
-            # Store per-request detail for verify-time cleanup of rejected k1/k2 slots
-            # For each request, record which draft token offsets (0-based from seq_len+1)
-            # triggered k1 and k2 entries.
+            # Store per-request detail for verify-time cleanup of rejected k1/k2 slots.
+            # Record (flat_offset, sparse_pos) for each draft token that triggers k1/k2.
+            # flat_offset is the 0-based index into this request's draft tokens (global = i*dtn + d).
             self._sparse_k1_draft_offsets = []
             self._sparse_k2_draft_offsets = []
             for batch_idx in range(bs):
                 sl = seq_lens_cpu[batch_idx].item()
                 k1_offsets = []
                 k2_offsets = []
-                for d in range(self.draft_token_num):
-                    pos = sl + d + 1  # position after appending (d+1)-th token
+                for d in range(dtn):
+                    pos = positions_cpu[batch_idx * dtn + d].item() + 1
+                    if pos <= sl:
+                        continue
                     if pos >= kernel_size and (pos - kernel_size) % kernel_stride == 0:
-                        k1_offsets.append(d)
+                        k1_offsets.append((d, pos))
                     if pos >= k2_kernel_size and (pos - k2_kernel_size) % k2_kernel_stride == 0:
-                        k2_offsets.append(d)
+                        k2_offsets.append((d, pos))
                 self._sparse_k1_draft_offsets.append(k1_offsets)
                 self._sparse_k2_draft_offsets.append(k2_offsets)
 
@@ -420,6 +436,23 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
+
+            # [DIAG-H4] Position 0 logits comparison: topk=1 vs topk>1
+            import os
+            if os.path.exists('/tmp/SGLANG_DIAG_LOGITS'):
+                if not hasattr(self, '_diag_logits_count'):
+                    self._diag_logits_count = 0
+                if self._diag_logits_count < 10:
+                    pos0_logits = logits_output.next_token_logits[0]
+                    pos0_top5 = torch.topk(pos0_logits, 5)
+                    print(f"[DIAG-H4] topk={self.topk} dtn={self.draft_token_num} bs={bs} "
+                          f"pos0_argmax={pos0_logits.argmax().item()} "
+                          f"pos0_top5_vals={[f'{v:.4f}' for v in pos0_top5.values.tolist()]} "
+                          f"pos0_top5_ids={pos0_top5.indices.tolist()} "
+                          f"target_predict_shape={target_predict.shape}",
+                          flush=True)
+                    self._diag_logits_count += 1
+
             target_predict = target_predict.reshape(bs, self.draft_token_num)
             predict, accept_index, accept_length = verify_tree_greedy_func(
                 predicts=predict,  # mutable
@@ -539,6 +572,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         if has_finished:
             accept_length = (accept_index != -1).sum(dim=1) - 1
 
+        # Save per-request accept_index before flattening (for sparse k1/k2 cleanup)
+        accept_index_2d_cpu = accept_index.tolist()
+
         # Free the KV cache for unaccepted tokens
         # TODO: fuse them
         accept_index = accept_index[accept_index != -1]
@@ -615,10 +651,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     tgt_cache_loc, src_cache_loc
                 )
 
-        # Free sparse k1/k2 slots for rejected draft tokens
-        # Each request accepted (accept_length[i]+1) tokens (including bonus token).
-        # Draft offsets >= accept_length[i]+1 are rejected; if they had sparse k1/k2
-        # entries, those slots must be freed and the mapping zeroed.
+        # Free sparse k1/k2 slots for rejected draft tokens.
+        # Uses accept_index to determine which flat draft offsets were accepted.
+        # Works for both topk=1 (chain) and topk>1 (tree).
         if (
             hasattr(self, '_sparse_k1_draft_offsets')
             and batch.model_config.has_sparse_attention
@@ -629,44 +664,113 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             kernel_stride = batch.model_config.sparse_kernel_stride
             k2_kernel_size = kernel_size * 4
             k2_kernel_stride = kernel_stride * 4
+            dtn = self.draft_token_num
+
+            # Build per-request set of accepted LOCAL offsets from accept_index_2d_cpu.
+            # accept_index_2d_cpu has shape [bs, spec_steps+1] with global flat indices
+            # (captured after finished-req handling but before flattening).
+            # Convert to local: local = global - i*dtn.
+            accepted_locals_per_req = []
+            for i in range(bs):
+                base = i * dtn
+                accepted = set()
+                for idx in accept_index_2d_cpu[i]:
+                    if idx == -1:
+                        break
+                    accepted.add(idx - base)
+                accepted_locals_per_req.append(accepted)
 
             k1_slots_to_free = []
             k2_slots_to_free = []
             for i in range(bs):
-                acc_len = accept_length_list[i]  # number of accepted draft tokens (bonus excluded from offsets)
-                sl = batch.seq_lens_cpu[i].item()  # seq_len BEFORE verify
-                # accepted offsets: 0..acc_len (inclusive, acc_len is the bonus token offset)
-                # rejected offsets: acc_len+1 .. draft_token_num-1
+                accepted = accepted_locals_per_req[i]
 
-                # k1: free rejected entries and zero them
-                for d in self._sparse_k1_draft_offsets[i]:
-                    if d > acc_len:
-                        # This draft offset was rejected; free its sparse k1 slot
-                        pos = sl + d + 1
+                # For topk>1, siblings at the same position share k1_idx.
+                # Build sets of k1_idx positions that have at least one accepted sibling.
+                k1_accepted_positions = set()
+                for d, pos in self._sparse_k1_draft_offsets[i]:
+                    if d in accepted:
                         k1_idx = (pos - kernel_size) // kernel_stride
-                        slot_val = batch.req_to_token_pool.req_to_sparse_k1_token[
-                            batch.req_pool_indices[i], k1_idx
-                        ].item()
-                        if slot_val != 0:
-                            k1_slots_to_free.append(slot_val)
-                        # Zero out the entry
-                        batch.req_to_token_pool.req_to_sparse_k1_token[
-                            batch.req_pool_indices[i], k1_idx
-                        ] = 0
+                        k1_accepted_positions.add(k1_idx)
 
-                # k2: free rejected entries and zero them
-                for d in self._sparse_k2_draft_offsets[i]:
-                    if d > acc_len:
-                        pos = sl + d + 1
+                k2_accepted_positions = set()
+                for d, pos in self._sparse_k2_draft_offsets[i]:
+                    if d in accepted:
                         k2_idx = (pos - k2_kernel_size) // k2_kernel_stride
-                        slot_val = batch.req_to_token_pool.req_to_sparse_k2_token[
-                            batch.req_pool_indices[i], k2_idx
-                        ].item()
-                        if slot_val != 0:
-                            k2_slots_to_free.append(slot_val)
-                        batch.req_to_token_pool.req_to_sparse_k2_token[
-                            batch.req_pool_indices[i], k2_idx
-                        ] = 0
+                        k2_accepted_positions.add(k2_idx)
+
+                # k1: free rejected entries, but ONLY zero/free if NO sibling
+                # at the same k1_idx is accepted (avoids use-after-free).
+                # Also fix the mapping: if an accepted sibling exists, ensure
+                # the mapping points to the ACCEPTED sibling's allocated slot.
+                for d, pos in self._sparse_k1_draft_offsets[i]:
+                    k1_idx = (pos - kernel_size) // kernel_stride
+                    if d not in accepted:
+                        if k1_idx not in k1_accepted_positions:
+                            # No sibling accepted at this position -> safe to free and zero
+                            slot_val = batch.req_to_token_pool.req_to_sparse_k1_token[
+                                batch.req_pool_indices[i], k1_idx
+                            ].item()
+                            if slot_val != 0:
+                                k1_slots_to_free.append(slot_val)
+                            batch.req_to_token_pool.req_to_sparse_k1_token[
+                                batch.req_pool_indices[i], k1_idx
+                            ] = 0
+                        # else: sibling accepted at same position -> don't touch mapping
+                        # The rejected sibling's allocated slot will be freed below.
+
+                # For topk>1 with colliding positions, the mapping may point to
+                # the wrong sibling's slot. Fix it: set mapping to accepted sibling's slot.
+                # Also free orphaned slots from non-accepted siblings.
+                if hasattr(batch, 'sparse_k1_loc') and batch.sparse_k1_loc is not None:
+                    pt = 0
+                    for batch_idx_check in range(i):
+                        pt += sum(1 for _, _ in self._sparse_k1_draft_offsets[batch_idx_check])
+                    for d, pos in self._sparse_k1_draft_offsets[i]:
+                        k1_idx = (pos - kernel_size) // kernel_stride
+                        slot = batch.sparse_k1_loc[pt].item() if pt < len(batch.sparse_k1_loc) else 0
+                        if d in accepted and k1_idx in k1_accepted_positions:
+                            # Write the ACCEPTED sibling's slot to the mapping
+                            batch.req_to_token_pool.write_sparse_k1(
+                                (batch.req_pool_indices[i], slice(k1_idx, k1_idx + 1)),
+                                batch.sparse_k1_loc[pt : pt + 1].to(torch.int32),
+                            )
+                        elif d not in accepted and k1_idx in k1_accepted_positions:
+                            # Free the rejected sibling's orphaned slot
+                            if slot != 0:
+                                k1_slots_to_free.append(slot)
+                        pt += 1
+
+                # k2: same logic as k1
+                for d, pos in self._sparse_k2_draft_offsets[i]:
+                    k2_idx = (pos - k2_kernel_size) // k2_kernel_stride
+                    if d not in accepted:
+                        if k2_idx not in k2_accepted_positions:
+                            slot_val = batch.req_to_token_pool.req_to_sparse_k2_token[
+                                batch.req_pool_indices[i], k2_idx
+                            ].item()
+                            if slot_val != 0:
+                                k2_slots_to_free.append(slot_val)
+                            batch.req_to_token_pool.req_to_sparse_k2_token[
+                                batch.req_pool_indices[i], k2_idx
+                            ] = 0
+
+                if hasattr(batch, 'sparse_k2_loc') and batch.sparse_k2_loc is not None:
+                    pt = 0
+                    for batch_idx_check in range(i):
+                        pt += sum(1 for _, _ in self._sparse_k2_draft_offsets[batch_idx_check])
+                    for d, pos in self._sparse_k2_draft_offsets[i]:
+                        k2_idx = (pos - k2_kernel_size) // k2_kernel_stride
+                        slot = batch.sparse_k2_loc[pt].item() if pt < len(batch.sparse_k2_loc) else 0
+                        if d in accepted and k2_idx in k2_accepted_positions:
+                            batch.req_to_token_pool.write_sparse_k2(
+                                (batch.req_pool_indices[i], slice(k2_idx, k2_idx + 1)),
+                                batch.sparse_k2_loc[pt : pt + 1].to(torch.int32),
+                            )
+                        elif d not in accepted and k2_idx in k2_accepted_positions:
+                            if slot != 0:
+                                k2_slots_to_free.append(slot)
+                        pt += 1
 
             if k1_slots_to_free:
                 token_to_kv_pool_allocator.free(

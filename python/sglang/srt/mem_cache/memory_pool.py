@@ -1008,6 +1008,33 @@ class MHATokenToKVPool(KVCache):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
+
+        layer_offset = layer_id - self.start_layer
+
+        # Use fused Triton kernel for FP8_E5M2 KV cache (BF16→FP8+scatter in one pass)
+        if (
+            self.dtype == torch.float8_e5m2
+            and cache_k.dtype != self.dtype
+            and cache_k.ndim == 3
+        ):
+            try:
+                from sglang.srt.layers.attention.triton_ops.fused_fp8e5m2_kv_write import (
+                    fused_fp8e5m2_set_kv_buffer,
+                )
+                fused_fp8e5m2_set_kv_buffer(
+                    k=cache_k,
+                    v=cache_v,
+                    k_cache=self.k_buffer[layer_offset],
+                    v_cache=self.v_buffer[layer_offset],
+                    cache_loc=loc,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                )
+                return
+            except Exception:
+                pass  # Fall back to original path
+
+        # Original path (for non-FP8_E5M2 or fallback)
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
@@ -1024,13 +1051,13 @@ class MHATokenToKVPool(KVCache):
             # Overlap the copy of K and V cache for small batch size
             current_stream = self.device_module.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+            self.k_buffer[layer_offset][loc] = cache_k
             with self.device_module.stream(self.alt_stream):
-                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+                self.v_buffer[layer_offset][loc] = cache_v
             current_stream.wait_stream(self.alt_stream)
         else:
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-            self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+            self.k_buffer[layer_offset][loc] = cache_k
+            self.v_buffer[layer_offset][loc] = cache_v
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
